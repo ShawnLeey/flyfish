@@ -2,6 +2,7 @@ package sqlnode
 
 import (
 	"github.com/BurntSushi/toml"
+	"log"
 	"sync/atomic"
 	"unsafe"
 )
@@ -14,6 +15,8 @@ type config struct {
 	DBConnections int
 
 	Compress bool
+
+	MaxRequestCount int
 
 	DBConfig struct {
 		SqlType string
@@ -44,13 +47,13 @@ var (
 	globalConf *config
 )
 
-func initConfig(filePath string) error {
+func initConfig(filePath string) {
 	conf := new(config)
 	if _, err := toml.DecodeFile(filePath, conf); err != nil {
-		return err
+		log.Fatalf("init config: %s.\n", err)
 	} else {
 		atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(&globalConf)), unsafe.Pointer(conf))
-		return nil
+		log.Println("init config.")
 	}
 }
 

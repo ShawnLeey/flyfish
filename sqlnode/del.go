@@ -1,7 +1,7 @@
 package sqlnode
 
 import (
-	"fmt"
+	"database/sql"
 	"github.com/jmoiron/sqlx"
 	"github.com/sniperHW/flyfish/errcode"
 	"github.com/sniperHW/flyfish/net"
@@ -10,7 +10,8 @@ import (
 )
 
 type sqlTaskDel struct {
-	cmd *cmdDel
+	sqlTaskBase
+	version *int64
 }
 
 func (t *sqlTaskDel) canCombine() bool {
@@ -21,49 +22,47 @@ func (t *sqlTaskDel) combine(cmd) bool {
 	return false
 }
 
-func (t *sqlTaskDel) do(db *sqlx.DB) {
-	slice := []interface{}{}
-	fmt.Println(slice[100])
-
+func (t *sqlTaskDel) do(db *sqlx.DB) (errCode int32, version int64, fields map[string]*proto.Field) {
 	var (
-		table   = t.cmd.table
-		key     = t.cmd.key
-		errCode int32
-		version int64
-		sqlStr  = getStr()
+		sqlStr = getStr()
+		result sql.Result
+		n      int64
+		err    error
 	)
 
-	sqlStr.AppendString("delete from ").AppendString(table)
-	sqlStr.AppendString(" where ").AppendString(keyFieldName).AppendString("='").AppendString(key).AppendString("'")
-	if t.cmd.version != nil {
-		sqlStr.AppendString(" and ").AppendString(versionFieldName).AppendString("=")
-		appendValue2SqlStr(sqlStr, versionFieldMeta.getType(), *t.cmd.version)
-	}
-	sqlStr.AppendString(";")
+	defer putStr(sqlStr)
+
+	appendSingleDeleteSqlStr(sqlStr, t.table, t.key, t.version)
 
 	s := sqlStr.ToString()
 	start := time.Now()
-	result, err := db.Exec(s)
-	getLogger().Debugf("task-del: table(%s) key(%s): delete query:\"%s\" cost:%.3fs.", table, key, s, time.Now().Sub(start).Seconds())
+	result, err = db.Exec(s)
+	getLogger().Debugf("task-del: table(%s) key(%s): delete query:\"%s\" cost:%.3fs.", t.table, t.key, s, time.Now().Sub(start).Seconds())
 
 	if err != nil {
-		getLogger().Errorf("task-del: table(%s) key(%s): delete: %s.", table, key, err)
+		getLogger().Errorf("task-del: table(%s) key(%s): delete: %s.", t.table, t.key, err)
 		errCode = errcode.ERR_SQLERROR
-	} else if n, err := result.RowsAffected(); err != nil {
-		getLogger().Errorf("task-del: table(%s) key(%s): delete: %s.", table, key, err)
+		return
+	}
+
+	if n, err = result.RowsAffected(); err != nil {
+		getLogger().Errorf("task-del: table(%s) key(%s): delete: %s.", t.table, t.key, err)
 		errCode = errcode.ERR_SQLERROR
-	} else if n > 0 {
-		errCode = errcode.ERR_OK
-	} else {
-		if t.cmd.version != nil {
+		return
+	}
+
+	if n <= 0 {
+		if t.version != nil {
 			errCode = errcode.ERR_VERSION_MISMATCH
 		} else {
 			errCode = errcode.ERR_RECORD_NOTEXIST
 		}
+		return
 	}
 
-	putStr(sqlStr)
-	t.cmd.reply(errCode, version, nil)
+	errCode = errcode.ERR_OK
+
+	return
 }
 
 type cmdDel struct {
@@ -71,8 +70,16 @@ type cmdDel struct {
 	version *int64
 }
 
+func (c *cmdDel) canCombine() bool {
+	return false
+}
+
 func (c *cmdDel) makeSqlTask() sqlTask {
-	return &sqlTaskDel{cmd: c}
+	return &sqlTaskDel{sqlTaskBase: newSqlTaskBase(c.table, c.key), version: c.version}
+}
+
+func (c *cmdDel) replyError(errCode int32) {
+	c.reply(errCode, 0, nil)
 }
 
 func (c *cmdDel) reply(errCode int32, version int64, fields map[string]*proto.Field) {
@@ -102,5 +109,5 @@ func onDel(cli *cliConn, msg *net.Message) {
 		version: req.Version,
 	}
 
-	pushCmd(cmd)
+	processCmd(cmd)
 }

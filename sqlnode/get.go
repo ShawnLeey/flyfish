@@ -10,13 +10,14 @@ import (
 import "github.com/sniperHW/flyfish/proto"
 
 type sqlTaskGet struct {
-	sqlCombinableTaskBase
+	sqlTaskBase
 	getAll    bool
 	getFields []string
-	//version   int64
-	//getWithVersion bool
-	//versionOp      string
-	fields map[string]*proto.Field
+	fields    map[string]*proto.Field
+}
+
+func (t *sqlTaskGet) canCombine() bool {
+	return true
 }
 
 func (t *sqlTaskGet) combine(c cmd) bool {
@@ -25,7 +26,7 @@ func (t *sqlTaskGet) combine(c cmd) bool {
 		return false
 	}
 
-	if c.uniKey() != t.uniKey {
+	if cmd.table != t.table || cmd.key != t.key {
 		return false
 	}
 
@@ -48,47 +49,41 @@ func (t *sqlTaskGet) combine(c cmd) bool {
 		}
 	}
 
-	t.addCmd(c)
-
 	return true
 }
 
-func (t *sqlTaskGet) do(db *sqlx.DB) {
-	tableMeta := getDBMeta().getTableMeta(t.table)
-
+func (t *sqlTaskGet) do(db *sqlx.DB) (errCode int32, version int64, fields map[string]*proto.Field) {
 	var (
+		tableMeta            = getDBMeta().getTableMeta(t.table)
 		queryFields          []string
 		queryFieldReceivers  []interface{}
 		queryFieldConverters []fieldConverter
 		queryFieldCount      int
 		getFieldOffset       int
 		versionIndex         int
-		errCode              int32
-		version              int64
 		sqlStr               = getStr()
+		err                  error
 	)
+
+	defer putStr(sqlStr)
 
 	if t.getAll {
 		queryFields = tableMeta.getAllFields()
 		queryFieldReceivers = tableMeta.getAllFieldReceivers()
 		queryFieldConverters = tableMeta.getAllFieldConverter()
 		queryFieldCount = len(queryFields)
-		getFieldOffset = 2
 		versionIndex = versionFieldIndex
-
-		appendSelectAllSqlStr(sqlStr, tableMeta, t.key, nil)
+		getFieldOffset = FirstFieldIndex
 	} else {
 		getFieldCount := len(t.getFields)
 		queryFieldCount = getFieldCount + 1
 		queryFields = make([]string, queryFieldCount)
 		queryFieldReceivers = make([]interface{}, queryFieldCount)
 		queryFieldConverters = make([]fieldConverter, queryFieldCount)
-
 		queryFields[0] = versionFieldName
 		queryFieldReceivers[0] = versionFieldMeta.getReceiver()
 		queryFieldConverters[0] = versionFieldMeta.getConverter()
 		versionIndex = 0
-
 		getFieldOffset = 1
 		for i := 0; i < getFieldCount; i++ {
 			fieldMeta := tableMeta.getFieldMeta(t.getFields[i])
@@ -96,43 +91,36 @@ func (t *sqlTaskGet) do(db *sqlx.DB) {
 			queryFieldReceivers[i+getFieldOffset] = fieldMeta.getReceiver()
 			queryFieldConverters[i+getFieldOffset] = fieldMeta.getConverter()
 		}
-
-		sqlStr.AppendString("select ")
-		sqlStr.AppendString(queryFields[0])
-		for i := 1; i < queryFieldCount; i++ {
-			sqlStr.AppendString(",")
-			sqlStr.AppendString(queryFields[i])
-		}
-		sqlStr.AppendString(" from ").AppendString(t.table).AppendString(" where ").AppendString(keyFieldName).AppendString("='").AppendString(t.key).AppendString("';")
 	}
+
+	appendSingleSelectFieldsSqlStr(sqlStr, t.table, t.key, nil, queryFields)
 
 	s := sqlStr.ToString()
 	start := time.Now()
 	row := db.QueryRowx(s)
 	getLogger().Debugf("task-get: table(%s) key(%s): query:\"%s\" cost:%.3fs.", t.table, t.key, s, time.Now().Sub(start).Seconds())
 
-	if err := row.Scan(queryFieldReceivers...); err == sql.ErrNoRows {
+	if err = row.Scan(queryFieldReceivers...); err == sql.ErrNoRows {
 		errCode = errcode.ERR_RECORD_NOTEXIST
-		//if t.getWithVersion {
-		//	t.errCode = errcode.ERR_RECORD_UNCHANGE
-		//} else {
-		//	t.errCode = errcode.ERR_RECORD_NOTEXIST
-		//}
-	} else if err != nil {
-		getLogger().Errorf("task-get table(%s) key(%s): %s.", t.table, t.key, err)
-		errCode = errcode.ERR_SQLERROR
-	} else {
-		errCode = errcode.ERR_OK
-		version = queryFieldConverters[versionIndex](queryFieldReceivers[versionIndex]).(int64)
-
-		for i := getFieldOffset; i < queryFieldCount; i++ {
-			fieldName := queryFields[i]
-			t.fields[fieldName] = proto.PackField(fieldName, queryFieldConverters[i](queryFieldReceivers[i]))
-		}
+		return
 	}
 
-	putStr(sqlStr)
-	t.reply(errCode, version, t.fields)
+	if err != nil {
+		getLogger().Errorf("task-get table(%s) key(%s): %s.", t.table, t.key, err)
+		errCode = errcode.ERR_SQLERROR
+		return
+	}
+
+	errCode = errcode.ERR_OK
+	version = queryFieldConverters[versionIndex](queryFieldReceivers[versionIndex]).(int64)
+
+	for i := getFieldOffset; i < queryFieldCount; i++ {
+		fieldName := queryFields[i]
+		t.fields[fieldName] = proto.PackField(fieldName, queryFieldConverters[i](queryFieldReceivers[i]))
+	}
+	fields = t.fields
+
+	return
 }
 
 type cmdGet struct {
@@ -140,6 +128,10 @@ type cmdGet struct {
 	getAll  bool
 	fields  []string
 	version *int64
+}
+
+func (c *cmdGet) canCombine() bool {
+	return true
 }
 
 //func (c *cmdGet) getReq() *proto.GetReq {
@@ -150,8 +142,8 @@ func (c *cmdGet) makeSqlTask() sqlTask {
 	tableFieldCount := getDBMeta().getTableMeta(c.table).getFieldCount()
 
 	task := &sqlTaskGet{
-		sqlCombinableTaskBase: newSqlCombinableTaskBase(c.uKey, c.table, c.key),
-		fields:                make(map[string]*proto.Field, tableFieldCount),
+		sqlTaskBase: newSqlTaskBase(c.table, c.key),
+		fields:      make(map[string]*proto.Field, tableFieldCount),
 	}
 
 	if c.getAll {
@@ -164,19 +156,11 @@ func (c *cmdGet) makeSqlTask() sqlTask {
 		}
 	}
 
-	//pVersion := c.version
-	//if pVersion != nil {
-	//	task.version = *pVersion
-	//	task.getWithVersion = true
-	//	task.versionOp = "!="
-	//} else {
-	//	task.version = 0
-	//	task.getWithVersion = false
-	//}
-
-	task.addCmd(c)
-
 	return task
+}
+
+func (c *cmdGet) replyError(errCode int32) {
+	c.reply(errCode, 0, nil)
 }
 
 func (c *cmdGet) reply(errCode int32, version int64, fields map[string]*proto.Field) {
@@ -189,7 +173,7 @@ func (c *cmdGet) reply(errCode int32, version int64, fields map[string]*proto.Fi
 		if errCode == errcode.ERR_OK {
 			if c.version != nil && version == *c.version {
 				errCode = errcode.ERR_RECORD_UNCHANGE
-			} else {
+			} else if len(fields) > 0 {
 				if c.getAll {
 					resp.Fields = make([]*proto.Field, len(fields))
 					i := 0
@@ -258,5 +242,5 @@ func onGet(conn *cliConn, msg *net.Message) {
 		version: req.Version,
 	}
 
-	pushCmd(cmd)
+	processCmd(cmd)
 }
